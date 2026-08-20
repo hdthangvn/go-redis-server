@@ -6,14 +6,23 @@ import (
 )
 
 type Counter struct {
-	value int
 	mutex sync.Mutex
+	value int
 }
 
+func (c *Counter) Value() int {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.value
+}
+
+// Nếu dòng nằm giữa Lock() và Unlock() bị lỗi hoặc panic, mutex ko gọi đc Unlock() -> bị deadLock.
+// Giải pháp dùng defer để đảm bảo Unlock() luôn được gọi.
 func (c *Counter) Increment() {
 	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	c.value++
-	c.mutex.Unlock()
+	// c.mutex.Unlock()
 }
 
 func main() {
@@ -31,5 +40,5 @@ func main() {
 
 	wg.Wait()
 
-	fmt.Println(counter.value)
+	fmt.Println(counter.Value())
 }
