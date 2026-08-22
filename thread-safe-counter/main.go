@@ -22,7 +22,6 @@ func (c *Counter) Increment() {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	c.value++
-	// c.mutex.Unlock()
 }
 
 func main() {
