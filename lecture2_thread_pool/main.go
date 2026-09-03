@@ -20,7 +20,7 @@ func (g *GoroutinePool) Return() {
 	<-g.semaphore
 }
 
-func handleConnection(c net.Conn) {
+func handleConnection(c net.Conn) { // làm việc thật sự với riêng khách này
 	defer c.Close()
 	buffer := make([]byte, 1024)
 	_, err := c.Read(buffer) // blocks until the client sends data
@@ -46,7 +46,7 @@ func main() {
 	}
 
 	for {
-		conn, err := ln.Accept()
+		conn, err := ln.Accept() // blocks until a client connects
 		if err != nil {
 			fmt.Println("Error accepting connection:", err)
 			continue
