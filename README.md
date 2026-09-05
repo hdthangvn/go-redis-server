@@ -1,4 +1,4 @@
-go-redis-server - ghi chú học tập (lecture 1 đến 4)
+go-redis-server - ghi chú học tập (lecture 1 đến 5)
 
 File này tóm tắt khái niệm cốt lõi của từng lecture, không đi sâu từng dòng code.
 Dùng để ôn lại nhanh, hoặc chuẩn bị trả lời phỏng vấn.
@@ -70,7 +70,25 @@ So sánh nhanh với lecture 1-3:
 Vấn đề để lại (đã biết trước, chưa xử lý): nếu 1 lệnh RESP bị cắt làm 2 lần đọc (TCP chia gói giữa chừng), code hiện tại không ghép lại - mỗi lần đọc tạo buffer mới, không giữ phần dữ liệu dở dang của lần đọc trước. Ít gặp khi test tay qua telnet/nc, nhưng là điểm chưa hoàn thiện so với server thật (Redis thật giữ 1 buffer riêng cho từng connection để ghép nối liền mạch).
 
 
-MẠCH TIẾN HOÁ XUYÊN SUỐT 4 LECTURE (điều quan trọng nhất để nhớ)
+LECTURE 5 - Protocol không-blocking + key hết hạn (lecture5_resp_protocol/)
+
+Lưu ý: lecture này thực ra gộp 2 chủ đề riêng biệt, không phải 1 khái niệm duy nhất.
+
+Chủ đề A - vá lỗ hổng của lecture 4 (lệnh bị cắt làm 2 lần đọc):
+- Đề bài: lecture 4 đọc bao nhiêu byte kernel đưa cho là xử lý ngay bấy nhiêu. Nếu 1 lệnh RESP bị TCP chia làm 2 gói (nửa đầu tới trước, nửa sau tới sau), lecture 4 sẽ đọc thiếu và coi là lỗi.
+- Cơ chế: mỗi kết nối có 1 vùng đệm riêng (map pending, connFd -> bytes chưa xử lý hết). Mỗi lần đọc thêm dữ liệu, nối vào phần dư của lần trước, rồi thử tách lệnh. Nếu chưa đủ dữ liệu để thành 1 lệnh hoàn chỉnh, ParseCommand trả về lỗi đặc biệt ErrIncomplete (nghĩa là "chưa xong, đừng huỷ, chờ thêm") thay vì báo lỗi thật, và không tiêu tốn byte nào - phần dữ liệu dở dang được giữ nguyên trong pending, chờ lần đọc kế tiếp nối thêm vào.
+- Đã kiểm tra thực tế: gửi 1 lệnh SET bị cắt làm 2 lần gửi cách nhau 0.3 giây, server vẫn ghép đúng và trả lời chính xác.
+
+Chủ đề B - key có thể tự hết hạn (TTL/expiry), giống Redis thật:
+- Đề bài: Redis thật cho phép đặt 1 key chỉ tồn tại trong X giây rồi tự biến mất (dùng làm cache, session, v.v.). Lecture 3/4 chưa có khái niệm này - key tồn tại mãi mãi cho tới khi bị SET đè.
+- Cơ chế: mỗi giá trị lưu trong store giờ có thêm "thời điểm hết hạn" (expireAt) đi kèm. Thêm các lệnh mới: SET ... EX giây / PX mili-giây (đặt hạn dùng), TTL/PTTL (hỏi còn bao lâu hết hạn), EXPIRE (đặt hạn dùng cho key đã có sẵn), DEL, EXISTS.
+- Có 2 cách 1 key hết hạn biến mất: "lazy" (khi GET/TTL tình cờ đọc trúng key đã hết hạn, xoá luôn lúc đó) và "active" (ActiveExpireCycle - định kỳ tự quét 1 mẫu nhỏ các key, xoá bớt key đã hết hạn, kể cả khi không ai đọc tới chúng) - giống hệt cách Redis thật vận hành, để key hết hạn không nằm mãi trong bộ nhớ chỉ vì không ai động tới.
+- Vì ActiveExpireCycle chạy định kỳ nhưng KHÔNG dùng goroutine/ticker riêng: main.go gọi Wait() của epoll/kqueue kèm 1 khoảng timeout (100ms) - nếu không có client nào gửi gì trong 100ms, Wait() tự trả về rỗng, và main.go nhân lúc đó gọi ActiveExpireCycle() ngay trên cùng 1 thread duy nhất. Nhờ vậy sync.Mutex có thể bỏ hẳn khỏi store - chỉ có đúng 1 goroutine (event loop) từng đụng vào dữ liệu, không còn ai để tranh chấp cùng lúc nữa.
+
+Vấn đề để lại: main.go mỗi lần có dữ liệu mới đều ghép "phần dư cũ + dữ liệu mới" thành 1 slice mới (có thể phải cấp phát lại bộ nhớ) - chấp nhận được với tải nhẹ, nhưng chưa phải cách tối ưu nhất cho server chịu tải cực cao.
+
+
+MẠCH TIẾN HOÁ XUYÊN SUỐT 5 LECTURE (điều quan trọng nhất để nhớ)
 
 L1: 1 kết nối = 1 goroutine, KHÔNG giới hạn số lượng
   -> vấn đề: quá tải khi có quá nhiều kết nối
@@ -79,5 +97,7 @@ L2: 1 kết nối = 1 goroutine, CÓ giới hạn bằng pool (semaphore)
 L3: giữ pool, nhưng đọc NHIỀU lệnh/kết nối + hiểu RESP protocol + lưu trữ có khoá
   -> vấn đề: vẫn tạo 1 goroutine/kết nối, không scale tốt khi có rất nhiều kết nối
 L4: bỏ goroutine-per-connection, dùng 1 thread + epoll/kqueue theo dõi TẤT CẢ kết nối
+  -> vấn đề: lệnh RESP bị cắt làm 2 lần đọc thì không ghép lại được; chưa có khái niệm key tự hết hạn
+L5: vá lỗi ghép lệnh bị cắt (pending buffer + ErrIncomplete) + thêm TTL/expiry giống Redis thật
 
 Mỗi lecture đều sinh ra từ 1 câu hỏi "cách hiện tại còn thiếu gì?" của lecture trước - đây là cách trả lời phỏng vấn tự nhiên nhất khi được hỏi "tại sao code lại thiết kế như vậy".

@@ -1,0 +1,151 @@
+// Lecture 5: same single-threaded epoll/kqueue event loop as lecture 4, but
+// now speaking a complete-enough RESP protocol - SET with EX/PX expiration,
+// TTL/PTTL, and commands that straddle multiple read() calls are correctly
+// reassembled instead of dropped.
+package main
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"syscall"
+	"time"
+
+	"go-redis-server/lecture5_resp_protocol/internal/command"
+	"go-redis-server/lecture5_resp_protocol/internal/protocol"
+	"go-redis-server/lecture5_resp_protocol/io_multiplexing"
+)
+
+// pending holds, per connection fd, whatever bytes have been read but not
+// yet parsed into a full command. Only the single event-loop goroutine ever
+// touches this map, so it needs no locking.
+var pending = make(map[int][]byte)
+
+// handleReadable is called once per read-ready event on connFd. It appends
+// this read's bytes to whatever was left over from the previous event, then
+// executes every complete RESP command it can parse out of the buffer. Any
+// trailing partial command stays in pending until the next readable event.
+func handleReadable(connFd int) {
+	buf := make([]byte, 4096)
+	n, err := syscall.Read(connFd, buf)
+	if err != nil || n == 0 {
+		if err != nil && err != io.EOF {
+			fmt.Println("read error:", err)
+		}
+		closeConn(connFd)
+		return
+	}
+
+	data := append(pending[connFd], buf[:n]...)
+	for {
+		cmd, consumed, err := protocol.ParseCommand(data)
+		if err == protocol.ErrIncomplete {
+			break
+		}
+		if err != nil {
+			fmt.Println("protocol error:", err)
+			closeConn(connFd)
+			return
+		}
+		data = data[consumed:]
+		if cmd.Name == "" {
+			continue
+		}
+
+		// handle that request
+		reply := command.Handle(cmd)
+
+		if _, err := syscall.Write(connFd, reply); err != nil {
+			fmt.Println("write error:", err)
+			closeConn(connFd)
+			return
+		}
+	}
+
+	if len(data) == 0 {
+		delete(pending, connFd)
+	} else {
+		leftover := make([]byte, len(data))
+		copy(leftover, data)
+		pending[connFd] = leftover
+	}
+}
+
+func closeConn(connFd int) {
+	_ = syscall.Close(connFd)
+	delete(pending, connFd)
+}
+
+func main() {
+	ln, err := net.Listen("tcp", ":3000")
+	if err != nil {
+		fmt.Println("listen error:", err)
+		return
+	}
+	fmt.Println("Server started on port 3000")
+
+	tcpListener := ln.(*net.TCPListener)
+	listenerFile, err := tcpListener.File()
+	if err != nil {
+		fmt.Println("failed to get listener fd:", err)
+		return
+	}
+	defer listenerFile.Close()
+	serverFd := int(listenerFile.Fd())
+
+	multiplexer, err := io_multiplexing.CreateIOMultiplexer()
+	if err != nil {
+		fmt.Println("failed to create io multiplexer:", err)
+		return
+	}
+	defer multiplexer.Close()
+
+	if err := multiplexer.Monitor(io_multiplexing.Event{Fd: serverFd, Op: io_multiplexing.OpRead}); err != nil {
+		fmt.Println("failed to monitor listener fd:", err)
+		return
+	}
+
+	// activeExpireInterval bounds multiplexer.Wait() so the loop wakes up
+	// on its own even when every connection is idle, and runs the active
+	// expiry sweep right here - same goroutine, same iteration, no ticker.
+	const activeExpireInterval = 100 * time.Millisecond
+	lastActiveExpire := time.Now()
+
+	for {
+		events, err := multiplexer.Wait(int(activeExpireInterval / time.Millisecond))
+		if err != nil {
+			// EINTR: Go's runtime async-preempts a hot goroutine with SIGURG,
+			// which interrupts a blocked epoll_wait/kevent syscall. Benign
+			// under load (e.g. redis-benchmark) - just retry, don't log.
+			if err == syscall.EINTR {
+				continue
+			}
+			fmt.Println("wait error: ", err)
+			continue
+		}
+
+		for _, event := range events {
+			if event.Fd == serverFd {
+				connFd, _, err := syscall.Accept(serverFd)
+				if err != nil {
+					fmt.Println("accept error:", err)
+					continue
+				}
+				if err := multiplexer.Monitor(io_multiplexing.Event{Fd: connFd, Op: io_multiplexing.OpRead}); err != nil {
+					fmt.Println("failed to monitor conn fd:", err)
+					_ = syscall.Close(connFd)
+				}
+				continue
+			}
+
+			// handle có event mới cho fd (có data mới hoặc có thể là fd đóng)
+			handleReadable(event.Fd)
+		}
+
+		// don't use time.sleep() here, because it is blocking function()
+		if time.Since(lastActiveExpire) >= activeExpireInterval {
+			command.ActiveExpireCycle()
+			lastActiveExpire = time.Now()
+		}
+	}
+}
